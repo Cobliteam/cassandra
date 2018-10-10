@@ -74,7 +74,7 @@ final class LogAwareFileLister
         }
         catch (Throwable t)
         {
-            throw new RuntimeException(String.format("Failed to list files in %s", folder), t);
+                throw new RuntimeException(String.format("Failed to list files in %s", folder), t);
         }
     }
 

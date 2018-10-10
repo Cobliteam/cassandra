@@ -19,31 +19,58 @@ package org.apache.cassandra.tools;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.*;
+import java.nio.ByteBuffer;
+import java.util.Arrays;
+import java.util.EnumSet;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.Set;
+import java.util.Spliterator;
+import java.util.Spliterators;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
 
-import org.apache.commons.cli.*;
+import org.apache.commons.cli.CommandLine;
+import org.apache.commons.cli.CommandLineParser;
+import org.apache.commons.cli.HelpFormatter;
+import org.apache.commons.cli.Option;
+import org.apache.commons.cli.Options;
+import org.apache.commons.cli.ParseException;
+import org.apache.commons.cli.PosixParser;
 
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.db.ClusteringBound;
+import org.apache.cassandra.db.DataRange;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.SerializationHeader;
+import org.apache.cassandra.db.Slice;
+import org.apache.cassandra.db.Slices;
+import org.apache.cassandra.db.filter.ClusteringIndexFilter;
+import org.apache.cassandra.db.filter.ClusteringIndexSliceFilter;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.marshal.CompositeType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
-import org.apache.cassandra.dht.*;
+import org.apache.cassandra.dht.AbstractBounds;
+import org.apache.cassandra.dht.Bounds;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.ISSTableScanner;
 import org.apache.cassandra.io.sstable.KeyIterator;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.format.SSTableReadsListener;
 import org.apache.cassandra.io.sstable.metadata.MetadataComponent;
 import org.apache.cassandra.io.sstable.metadata.MetadataType;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Pair;
 
 /**
  * Export SSTables to JSON format.
@@ -56,6 +83,10 @@ public class SSTableExport
     private static final String EXCLUDE_KEY_OPTION = "x";
     private static final String ENUMERATE_KEYS_OPTION = "e";
     private static final String RAW_TIMESTAMPS = "t";
+    private static final String START_TOKEN = "st";
+    private static final String END_TOKEN = "et";
+    private static final String CLUSTERING_START = "cs";
+    private static final String CLUSTERING_END = "ce";
 
     private static final Options options = new Options();
     private static CommandLine cmd;
@@ -82,6 +113,18 @@ public class SSTableExport
 
         Option rawTimestamps = new Option(RAW_TIMESTAMPS, false, "Print raw timestamps instead of iso8601 date strings");
         options.addOption(rawTimestamps);
+
+        Option startToken = new Option(START_TOKEN, true, "Specify token of the first partition of the dump range");
+        options.addOption(startToken);
+
+        Option endToken = new Option(END_TOKEN, true, "Specify token of the partition in which the dump range ends");
+        options.addOption(endToken);
+
+        Option clusteringStart = new Option(CLUSTERING_START, true, "Specify clustering key to start dump at in each partition");
+        options.addOption(clusteringStart);
+
+        Option clusteringEnd = new Option(CLUSTERING_END, true, "Specify clustering key to end dump at in each partition");
+        options.addOption(clusteringEnd);
     }
 
     /**
@@ -120,10 +163,131 @@ public class SSTableExport
         return builder.build();
     }
 
+    private static <T> Stream<T> arrayToStream(T[] items) {
+        if (items == null)
+            return Stream.empty();
+
+        return Arrays.stream(items);
+    }
+
     private static <T> Stream<T> iterToStream(Iterator<T> iter)
     {
         Spliterator<T> splititer = Spliterators.spliteratorUnknownSize(iter, Spliterator.IMMUTABLE);
         return StreamSupport.stream(splititer, false);
+    }
+
+    private static Stream<DecoratedKey> decorateKeys(CFMetaData metadata, Stream<String> keys) {
+        return keys
+            .map(metadata.getKeyValidator()::fromString)
+            .map(metadata.partitioner::decorateKey);
+    }
+
+    private static ClusteringBound parseClusteringBound(CFMetaData metadata, String value, boolean isStart,
+                                                 boolean isInclusive) {
+        CompositeType clusteringKeyType = CompositeType.getInstance(metadata.comparator.subtypes());
+        ByteBuffer buf = clusteringKeyType.fromString(value);
+        ByteBuffer[] components = clusteringKeyType.split(buf);
+        return ClusteringBound.create(ClusteringBound.boundKind(isStart, isInclusive), components);
+    }
+
+    private static Stream<AbstractBounds<PartitionPosition>> defaultBounds(CFMetaData metadata) {
+        return Stream.of(Range.makeRowRange(metadata.partitioner.getMinimumToken(),
+                                            metadata.partitioner.getMaximumToken()));
+    }
+
+    private static ClusteringIndexFilter defaultClusteringFilter(CFMetaData metadata) {
+        return new ClusteringIndexSliceFilter(Slices.ALL, false);
+    }
+
+    private static String prepareToken(String token) {
+        if (token.startsWith("\\-"))
+            return token.substring(1);
+        else
+            return token;
+    }
+
+    private static Stream<Pair<ISSTableScanner, Stream<UnfilteredRowIterator>>> getFilteredDumpStream(final SSTableReader sstable, CFMetaData metadata) {
+        String[] keys = cmd.getOptionValues(KEY_OPTION);
+        String[] excludes = cmd.getOptionValues(EXCLUDE_KEY_OPTION);
+
+        String startToken = cmd.getOptionValue(START_TOKEN);
+        String endToken = cmd.getOptionValue(END_TOKEN);
+
+        String clusteringStart = cmd.getOptionValue(CLUSTERING_START);
+        String clusteringEnd = cmd.getOptionValue(CLUSTERING_END);
+
+        Stream<AbstractBounds<PartitionPosition>> bounds = defaultBounds(metadata);
+        ClusteringIndexFilter clusteringFilter = defaultClusteringFilter(metadata);
+        Set<DecoratedKey> excludedPartitions = null;
+
+        if (keys != null || excludes != null) {
+            if (startToken != null || endToken != null) {
+                System.err.println("Key inclusion or exclusion options cannot be combined with a token range");
+                return null;
+            }
+
+            if (cmd.hasOption(ENUMERATE_KEYS_OPTION)) {
+                System.err.println("Enumerate keys option cannot be used with key inclusion or exclusion");
+                return null;
+            }
+
+            // We only have excludes, so convert the keys early, since we're gonna be using them for
+            // frequent comparisons
+            if (keys == null) {
+                excludedPartitions = decorateKeys(metadata, arrayToStream(excludes))
+                    .collect(Collectors.toSet());
+            } else {
+                Set<String> excludeSet = arrayToStream(excludes).collect(Collectors.toSet());
+                Stream<String> filteredkeys = arrayToStream(keys).filter(key -> !excludeSet.contains(key));
+
+                bounds = decorateKeys(metadata, filteredkeys)
+                    .sorted()
+                    .map(DecoratedKey::getToken)
+                    .map(token -> new Bounds<>(token.minKeyBound(), token.maxKeyBound()));
+
+            }
+        } else if (startToken != null || endToken != null) {
+            Token.TokenFactory tokenFactory = metadata.partitioner.getTokenFactory();
+            Token left = startToken == null
+                ? metadata.partitioner.getMinimumToken()
+                : tokenFactory.fromString(prepareToken(startToken));
+            Token right = endToken == null
+                ? metadata.partitioner.getMaximumToken()
+                : tokenFactory.fromString(prepareToken(endToken));
+
+            System.err.println("Tokens " + left + " " + right);
+
+            bounds = Stream.of(Range.makeRowRange(left, right));
+        }
+
+        if (clusteringStart != null || clusteringEnd != null) {
+            ClusteringBound clusteringStartBound = clusteringStart == null
+                ? ClusteringBound.BOTTOM
+                : parseClusteringBound(metadata, clusteringStart, true, true);
+            ClusteringBound clusteringEndBound = clusteringEnd == null
+                ? ClusteringBound.TOP
+                : parseClusteringBound(metadata, clusteringEnd, false, false);
+
+            System.err.println("Clustering Start " + clusteringStartBound);
+            System.err.println("Clustering End " + clusteringEndBound);
+
+            Slices slices = Slices.with(metadata.comparator, Slice.make(clusteringStartBound, clusteringEndBound));
+            clusteringFilter = new ClusteringIndexSliceFilter(slices, false);
+        }
+
+        final Set<DecoratedKey> actualExcludedPartitions = excludedPartitions;
+        final ClusteringIndexFilter actualClusteringFilter = clusteringFilter;
+        return bounds.map(bound -> {
+            ISSTableScanner scanner = sstable.getScanner(
+                ColumnFilter.all(metadata), new DataRange(bound, actualClusteringFilter), false,
+                SSTableReadsListener.NOOP_LISTENER);
+
+            Stream<UnfilteredRowIterator> rowStream = iterToStream(scanner);
+            if (actualExcludedPartitions != null)
+                rowStream = rowStream.filter(i -> !actualExcludedPartitions.contains(i.partitionKey()));
+
+            return Pair.create(scanner, rowStream);
+        });
     }
 
     /**
@@ -155,11 +319,8 @@ public class SSTableExport
             System.exit(1);
         }
 
-        String[] keys = cmd.getOptionValues(KEY_OPTION);
-        HashSet<String> excludes = new HashSet<>(Arrays.asList(
-                cmd.getOptionValues(EXCLUDE_KEY_OPTION) == null
-                        ? new String[0]
-                        : cmd.getOptionValues(EXCLUDE_KEY_OPTION)));
+
+
         String ssTableFileName = new File(cmd.getArgs()[0]).getAbsolutePath();
 
         if (Descriptor.isLegacyFile(new File(ssTableFileName)))
@@ -172,6 +333,7 @@ public class SSTableExport
             System.err.println("Cannot find file " + ssTableFileName);
             System.exit(1);
         }
+
         Descriptor desc = Descriptor.fromFilename(ssTableFileName);
         try
         {
@@ -188,63 +350,62 @@ public class SSTableExport
             }
             else
             {
-                SSTableReader sstable = SSTableReader.openNoValidation(desc, metadata);
-                IPartitioner partitioner = sstable.getPartitioner();
-                final ISSTableScanner currentScanner;
-                if ((keys != null) && (keys.length > 0))
-                {
-                    List<AbstractBounds<PartitionPosition>> bounds = Arrays.stream(keys)
-                            .filter(key -> !excludes.contains(key))
-                            .map(metadata.getKeyValidator()::fromString)
-                            .map(partitioner::decorateKey)
-                            .sorted()
-                            .map(DecoratedKey::getToken)
-                            .map(token -> new Bounds<>(token.minKeyBound(), token.maxKeyBound())).collect(Collectors.toList());
-                    currentScanner = sstable.getScanner(bounds.iterator());
-                }
-                else
-                {
-                    currentScanner = sstable.getScanner();
-                }
-                Stream<UnfilteredRowIterator> partitions = iterToStream(currentScanner).filter(i ->
-                    excludes.isEmpty() || !excludes.contains(metadata.getKeyValidator().getString(i.partitionKey().getKey()))
-                );
-                if (cmd.hasOption(DEBUG_OUTPUT_OPTION))
-                {
-                    AtomicLong position = new AtomicLong();
-                    partitions.forEach(partition ->
-                    {
-                        position.set(currentScanner.getCurrentPosition());
+                boolean debug = cmd.hasOption(DEBUG_OUTPUT_OPTION);
 
-                        if (!partition.partitionLevelDeletion().isLive())
-                        {
-                            System.out.println("[" + metadata.getKeyValidator().getString(partition.partitionKey().getKey()) + "]@" +
-                                               position.get() + " " + partition.partitionLevelDeletion());
-                        }
-                        if (!partition.staticRow().isEmpty())
-                        {
-                            System.out.println("[" + metadata.getKeyValidator().getString(partition.partitionKey().getKey()) + "]@" +
-                                               position.get() + " " + partition.staticRow().toString(metadata, true));
-                        }
-                        partition.forEachRemaining(row ->
-                        {
-                            System.out.println(
-                                    "[" + metadata.getKeyValidator().getString(partition.partitionKey().getKey()) + "]@"
-                                            + position.get() + " " + row.toString(metadata, false, true));
-                            position.set(currentScanner.getCurrentPosition());
-                        });
-                    });
+                SSTableReader sstable = SSTableReader.openNoValidation(desc, metadata);
+                Stream<Pair<ISSTableScanner, Stream<UnfilteredRowIterator>>> scannersPartitions = getFilteredDumpStream(sstable, metadata);
+                if (scannersPartitions == null) {
+                    printUsage();
+                    System.exit(1);
                 }
-                else
+
+                scannersPartitions.forEach(scannerPartition ->
                 {
-                    JsonTransformer.toJson(currentScanner, partitions, cmd.hasOption(RAW_TIMESTAMPS), metadata, System.out);
-                }
+                    ISSTableScanner scanner = scannerPartition.left;
+                    Stream<UnfilteredRowIterator> partitions = scannerPartition.right;
+
+                    try {
+                        if (debug)
+                        {
+                            AtomicLong position = new AtomicLong();
+                            partitions.forEach(partition -> {
+                                System.err.println("Partition token " + partition.partitionKey().getToken());
+                                if (!partition.partitionLevelDeletion().isLive())
+                                {
+                                    System.out.println("[" + metadata.getKeyValidator().getString(partition.partitionKey().getKey()) + "]@" +
+                                                       position.get() + " " + partition.partitionLevelDeletion());
+                                }
+                                if (!partition.staticRow().isEmpty())
+                                {
+                                    System.out.println("[" + metadata.getKeyValidator().getString(partition.partitionKey().getKey()) + "]@" +
+                                                       position.get() + " " + partition.staticRow().toString(metadata, true));
+                                }
+                                partition.forEachRemaining(row ->
+                                {
+                                    System.out.println(
+                                            "[" + metadata.getKeyValidator().getString(partition.partitionKey().getKey()) + "]@"
+                                                    + position.get() + " " + row.toString(metadata, false, true));
+                                });
+                            });
+                        }
+                        else
+                        {
+                            try {
+                                JsonTransformer.toJson(scanner, partitions, cmd.hasOption(RAW_TIMESTAMPS), metadata, System.out);
+                            } catch (IOException e) {
+                                throw new RuntimeException("Failed to scan SSTable to JSON", e);
+                            }
+                        }
+                    } catch (Exception e) {
+                        e.printStackTrace(System.err);
+                        System.exit(1);
+                    }
+                });
             }
         }
         catch (IOException e)
         {
             // throwing exception outside main with broken pipe causes windows cmd to hang
-            e.printStackTrace(System.err);
         }
 
         System.exit(0);
