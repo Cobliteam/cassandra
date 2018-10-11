@@ -28,6 +28,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 import java.util.stream.Stream;
 
 import org.apache.cassandra.config.CFMetaData;
@@ -51,9 +52,12 @@ import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.codehaus.jackson.JsonFactory;
 import org.codehaus.jackson.JsonGenerator;
+import org.codehaus.jackson.PrettyPrinter;
 import org.codehaus.jackson.impl.Indenter;
 import org.codehaus.jackson.util.DefaultPrettyPrinter;
 import org.codehaus.jackson.util.DefaultPrettyPrinter.NopIndenter;
+import org.codehaus.jackson.util.MinimalPrettyPrinter;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -66,53 +70,64 @@ public final class JsonTransformer
 
     private final JsonGenerator json;
 
-    private final CompactIndenter objectIndenter = new CompactIndenter();
-
-    private final CompactIndenter arrayIndenter = new CompactIndenter();
-
     private final CFMetaData metadata;
 
     private final ISSTableScanner currentScanner;
 
-    private boolean rawTime = false;
+    private final boolean rawTime;
+
+    private final boolean minimal;
+
+    private final CompactIndenter objectIndenter = new CompactIndenter();
+
+    private final CompactIndenter arrayIndenter = new CompactIndenter();
 
     private long currentPosition = 0;
 
-    private JsonTransformer(JsonGenerator json, ISSTableScanner currentScanner, boolean rawTime, CFMetaData metadata)
+    private static JsonGenerator jsonGenerator(OutputStream out, boolean minimal) throws IOException {
+        JsonGenerator json = jsonFactory.createJsonGenerator(new OutputStreamWriter(out, StandardCharsets.UTF_8));
+        if (minimal) {
+            MinimalPrettyPrinter minimalPrettyPrinter = new MinimalPrettyPrinter();
+            minimalPrettyPrinter.setRootValueSeparator("\n");
+            json.setPrettyPrinter(minimalPrettyPrinter);
+        } else {
+            DefaultPrettyPrinter defaultPrettyPrinter = new DefaultPrettyPrinter();
+            defaultPrettyPrinter.indentObjectsWith(new CompactIndenter());
+            defaultPrettyPrinter.indentArraysWith(new CompactIndenter());
+            json.setPrettyPrinter(defaultPrettyPrinter);
+        }
+
+        return json;
+    }
+
+    public JsonTransformer(ISSTableScanner currentScanner, CFMetaData metadata, OutputStream out, boolean rawTime,
+                           boolean minimal) throws IOException
     {
-        this.json = json;
+        this.json = jsonGenerator(out, minimal);
         this.metadata = metadata;
         this.currentScanner = currentScanner;
         this.rawTime = rawTime;
-
-        DefaultPrettyPrinter prettyPrinter = new DefaultPrettyPrinter();
-        prettyPrinter.indentObjectsWith(objectIndenter);
-        prettyPrinter.indentArraysWith(arrayIndenter);
-        json.setPrettyPrinter(prettyPrinter);
+        this.minimal = minimal;
     }
 
-    public static void toJson(ISSTableScanner currentScanner, Stream<UnfilteredRowIterator> partitions, boolean rawTime, CFMetaData metadata, OutputStream out)
-            throws IOException
-    {
-        try (JsonGenerator json = jsonFactory.createJsonGenerator(new OutputStreamWriter(out, StandardCharsets.UTF_8)))
-        {
-            JsonTransformer transformer = new JsonTransformer(json, currentScanner, rawTime, metadata);
+    private <T> void writeStream(Stream<T> elements, Consumer<T> serialize) throws IOException {
+        if (!minimal) {
             json.writeStartArray();
-            partitions.forEach(transformer::serializePartition);
+            elements.forEach(serialize);
             json.writeEndArray();
+        } else {
+            elements.forEach(serialize);
         }
     }
 
-    public static void keysToJson(ISSTableScanner currentScanner, Stream<DecoratedKey> keys, boolean rawTime, CFMetaData metadata, OutputStream out) throws IOException
-    {
-        try (JsonGenerator json = jsonFactory.createJsonGenerator(new OutputStreamWriter(out, StandardCharsets.UTF_8)))
-        {
-            JsonTransformer transformer = new JsonTransformer(json, currentScanner, rawTime, metadata);
-            json.writeStartArray();
-            keys.forEach(transformer::serializePartitionKey);
-            json.writeEndArray();
-        }
+    public void writePartitions(Stream<UnfilteredRowIterator> partitions) throws IOException {
+        writeStream(partitions, this::serializePartition);
     }
+
+    public void writeKeys(Stream<DecoratedKey> keys) throws IOException {
+        writeStream(keys, this::serializePartitionKey);
+    }
+
 
     private void updatePosition()
     {
@@ -491,7 +506,7 @@ public final class JsonTransformer
         {
             return Long.toString(time);
         }
-        
+
         long secs = from.toSeconds(time);
         long offset = Math.floorMod(from.toNanos(time), 1000_000_000L); // nanos per sec
         return Instant.ofEpochSecond(secs, offset).toString();

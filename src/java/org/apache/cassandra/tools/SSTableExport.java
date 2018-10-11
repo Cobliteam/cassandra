@@ -83,6 +83,7 @@ public class SSTableExport
     private static final String EXCLUDE_KEY_OPTION = "x";
     private static final String ENUMERATE_KEYS_OPTION = "e";
     private static final String RAW_TIMESTAMPS = "t";
+    private static final String MINIMAL_JSON = "mj";
     private static final String START_TOKEN = "st";
     private static final String END_TOKEN = "et";
     private static final String CLUSTERING_START = "cs";
@@ -113,6 +114,9 @@ public class SSTableExport
 
         Option rawTimestamps = new Option(RAW_TIMESTAMPS, false, "Print raw timestamps instead of iso8601 date strings");
         options.addOption(rawTimestamps);
+
+        Option minimalJson = new Option(MINIMAL_JSON, false, "Output one partition per-line as unformatted JSON");
+        options.addOption(minimalJson);
 
         Option startToken = new Option(START_TOKEN, true, "Specify token of the first partition of the dump range");
         options.addOption(startToken);
@@ -342,10 +346,9 @@ public class SSTableExport
             {
                 try (KeyIterator iter = new KeyIterator(desc, metadata))
                 {
-                    JsonTransformer.keysToJson(null, iterToStream(iter),
-                                               cmd.hasOption(RAW_TIMESTAMPS),
-                                               metadata,
-                                               System.out);
+                    JsonTransformer transformer = new JsonTransformer(
+                        null, metadata, System.out, cmd.hasOption(RAW_TIMESTAMPS), cmd.hasOption(MINIMAL_JSON));
+                    transformer.writeKeys(iterToStream(iter));
                 }
             }
             else
@@ -390,11 +393,10 @@ public class SSTableExport
                         }
                         else
                         {
-                            try {
-                                JsonTransformer.toJson(scanner, partitions, cmd.hasOption(RAW_TIMESTAMPS), metadata, System.out);
-                            } catch (IOException e) {
-                                throw new RuntimeException("Failed to scan SSTable to JSON", e);
-                            }
+                            JsonTransformer transformer = new JsonTransformer(
+                                scanner, metadata, System.out, cmd.hasOption(RAW_TIMESTAMPS),
+                                cmd.hasOption(MINIMAL_JSON));
+                            transformer.writePartitions(partitions);
                         }
                     } catch (Exception e) {
                         e.printStackTrace(System.err);
